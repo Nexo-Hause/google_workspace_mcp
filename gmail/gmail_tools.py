@@ -2022,7 +2022,9 @@ _RAW_COMMON_HEADERS = frozenset({
     "x-google-smtp-source", "x-forwarded-to", "x-forwarded-for",
 })
 
-_HTML_COMMENT_RE = re.compile(r"<!--\s*(\w+)\s*([\s\S]*?)-->", re.DOTALL)
+# Only match comments that start with an UPPER_SNAKE_CASE tag (e.g. NEXO_DATA).
+# This avoids false positives from regular HTML comments like <!-- page layout -->.
+_HTML_COMMENT_RE = re.compile(r"<!--\s*([A-Z][A-Z0-9_]+)\s*([\s\S]*?)-->")
 
 
 @server.tool()
@@ -2047,7 +2049,7 @@ async def get_gmail_message_raw(
     By default the tool returns:
     1. Basic envelope (Subject, From, Date)
     2. All non-standard headers (filtering out common transport headers)
-    3. Content of every HTML comment found in the HTML body
+    3. Content of HTML comments whose tag is UPPER_SNAKE_CASE (e.g. NEXO_DATA)
 
     Use ``extract_headers`` to request only specific headers and
     ``include_html=True`` to get the full HTML body.
@@ -2058,8 +2060,8 @@ async def get_gmail_message_raw(
         extract_headers: List of header names to return. If *None*, all
             non-standard headers are returned. Case-insensitive.
         include_html: If *True*, appends the full HTML body (truncated at
-            20 000 chars). If *False* (default), only HTML comments are
-            extracted.
+            20 000 chars). If *False* (default), only UPPER_SNAKE_CASE
+            HTML comments are extracted (e.g. ``<!-- NEXO_DATA ... -->``).
 
     Returns:
         str: Formatted message with headers and/or HTML content.
