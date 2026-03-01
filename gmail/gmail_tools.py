@@ -4,9 +4,11 @@ Google Gmail MCP Tools
 This module provides MCP tools for interacting with the Gmail API.
 """
 
+import email
 import logging
 import asyncio
 import base64
+import re
 import ssl
 import mimetypes
 from html.parser import HTMLParser
@@ -2006,3 +2008,154 @@ async def batch_modify_gmail_message_labels(
         actions.append(f"Removed labels: {', '.join(remove_label_ids)}")
 
     return f"Labels updated for {len(message_ids)} messages: {'; '.join(actions)}"
+
+
+# Headers excluded from custom-header output because they are either already
+# surfaced by get_gmail_message_content or are infrastructure / transport noise.
+_RAW_COMMON_HEADERS = frozenset({
+    "subject", "from", "to", "cc", "bcc", "date", "message-id",
+    "in-reply-to", "references", "mime-version", "content-type",
+    "content-transfer-encoding", "delivered-to", "received",
+    "return-path", "authentication-results", "dkim-signature",
+    "arc-seal", "arc-message-signature", "arc-authentication-results",
+    "x-received", "x-google-dkim-signature", "x-gm-message-state",
+    "x-google-smtp-source", "x-forwarded-to", "x-forwarded-for",
+})
+
+_HTML_COMMENT_RE = re.compile(r"<!--\s*(\w+)\s*([\s\S]*?)-->", re.DOTALL)
+
+
+@server.tool()
+@handle_http_errors("get_gmail_message_raw", is_read_only=True, service_type="gmail")
+@require_google_service("gmail", "gmail_read")
+async def get_gmail_message_raw(
+    service,
+    message_id: str,
+    user_google_email: str,
+    extract_headers: Optional[List[str]] = None,
+    include_html: bool = False,
+) -> str:
+    """
+    Retrieves a Gmail message in raw RFC 2822 format, exposing custom headers
+    and HTML body content that are not available through get_gmail_message_content.
+
+    Use this when you need:
+    - Custom email headers (e.g., X-Nexo-Data, X-Priority)
+    - HTML comments embedded in the email body (e.g., <!-- NEXO_DATA {...} -->)
+    - The original HTML body without plain-text conversion
+
+    By default the tool returns:
+    1. Basic envelope (Subject, From, Date)
+    2. All non-standard headers (filtering out common transport headers)
+    3. Content of every HTML comment found in the HTML body
+
+    Use ``extract_headers`` to request only specific headers and
+    ``include_html=True`` to get the full HTML body.
+
+    Args:
+        message_id: The unique ID of the Gmail message to retrieve.
+        user_google_email: The user's Google email address. Required.
+        extract_headers: List of header names to return. If *None*, all
+            non-standard headers are returned. Case-insensitive.
+        include_html: If *True*, appends the full HTML body (truncated at
+            20 000 chars). If *False* (default), only HTML comments are
+            extracted.
+
+    Returns:
+        str: Formatted message with headers and/or HTML content.
+    """
+    logger.info(
+        "[get_gmail_message_raw] Invoked. Message ID: '%s', Email: '%s', "
+        "extract_headers=%s, include_html=%s",
+        message_id, user_google_email, extract_headers, include_html,
+    )
+
+    # Fetch the raw RFC 2822 message
+    message_raw = await asyncio.to_thread(
+        service.users()
+        .messages()
+        .get(userId="me", id=message_id, format="raw")
+        .execute
+    )
+
+    raw_data = message_raw.get("raw", "")
+    if not raw_data:
+        return f"Error: No raw data found for message {message_id}"
+
+    # Decode the base64url-encoded raw message
+    raw_bytes = base64.urlsafe_b64decode(raw_data)
+    msg = email.message_from_bytes(raw_bytes)
+
+    # ── Envelope ────────────────────────────────────────────────────────
+    content_lines: list[str] = [
+        f"Message ID: {message_id}",
+        f"Subject: {msg.get('Subject', '(no subject)')}",
+        f"From: {msg.get('From', '(unknown)')}",
+        f"Date: {msg.get('Date', '(unknown)')}",
+        "",
+    ]
+
+    # ── Headers ─────────────────────────────────────────────────────────
+    if extract_headers:
+        content_lines.append("--- REQUESTED HEADERS ---")
+        for name in extract_headers:
+            value = msg.get(name)
+            if value:
+                display = value if len(value) <= 5000 else value[:5000] + "..."
+                content_lines.append(f"{name}: {display}")
+            else:
+                content_lines.append(f"{name}: (not found)")
+    else:
+        custom: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for key, value in msg.items():
+            low = key.lower()
+            if low not in _RAW_COMMON_HEADERS and low not in seen:
+                custom.append((key, value))
+                seen.add(low)
+
+        content_lines.append("--- CUSTOM HEADERS ---")
+        if custom:
+            for key, value in custom:
+                display = value if len(value) <= 5000 else value[:5000] + "..."
+                content_lines.append(f"{key}: {display}")
+        else:
+            content_lines.append("(no custom headers found)")
+
+    content_lines.append("")
+
+    # ── HTML body & comments ────────────────────────────────────────────
+    html_body: Optional[str] = None
+    for part in msg.walk():
+        if part.get_content_type() == "text/html":
+            charset = part.get_content_charset() or "utf-8"
+            payload_bytes = part.get_payload(decode=True)
+            if payload_bytes:
+                html_body = payload_bytes.decode(charset, errors="ignore")
+                break
+
+    if html_body:
+        comments = _HTML_COMMENT_RE.findall(html_body)
+        if comments:
+            content_lines.append("--- HTML COMMENTS ---")
+            for tag, body_text in comments:
+                stripped = body_text.strip()
+                if len(stripped) > 10_000:
+                    stripped = stripped[:10_000] + "\n... (truncated)"
+                content_lines.append(f"[{tag}]")
+                content_lines.append(stripped)
+                content_lines.append("")
+
+        if include_html:
+            content_lines.append("--- HTML BODY ---")
+            if len(html_body) > HTML_BODY_TRUNCATE_LIMIT:
+                content_lines.append(
+                    html_body[:HTML_BODY_TRUNCATE_LIMIT]
+                    + "\n\n[Content truncated...]"
+                )
+            else:
+                content_lines.append(html_body)
+    else:
+        content_lines.append("(no HTML body found)")
+
+    return "\n".join(content_lines)
