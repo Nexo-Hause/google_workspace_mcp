@@ -2006,3 +2006,148 @@ async def batch_modify_gmail_message_labels(
         actions.append(f"Removed labels: {', '.join(remove_label_ids)}")
 
     return f"Labels updated for {len(message_ids)} messages: {'; '.join(actions)}"
+
+
+@server.tool()
+@handle_http_errors("get_gmail_message_raw", is_read_only=True, service_type="gmail")
+@require_google_service("gmail", "gmail_read")
+async def get_gmail_message_raw(
+    service,
+    message_id: str,
+    user_google_email: str,
+    extract_headers: Optional[List[str]] = None,
+    include_html: bool = False,
+) -> str:
+    """
+    Retrieves a Gmail message in raw RFC 2822 format, exposing custom headers
+    and HTML body content that are not available through get_gmail_message_content.
+
+    Use this tool when you need to access:
+    - Custom email headers (e.g., X-Nexo-Data, X-Priority)
+    - HTML comments embedded in the email body
+    - The original HTML body without text conversion
+
+    Args:
+        message_id (str): The unique ID of the Gmail message to retrieve.
+        user_google_email (str): The user's Google email address. Required.
+        extract_headers (Optional[List[str]]): List of specific header names to extract
+            and return. If None, returns all non-standard headers (excluding common ones
+            like Subject, From, To, Date, etc.). Case-insensitive matching.
+        include_html (bool): If True, includes the full HTML body in the response.
+            If False (default), only includes extracted data from HTML comments
+            matching the pattern <!-- TAG_NAME ... -->.
+
+    Returns:
+        str: Formatted message with requested headers and/or HTML content.
+    """
+    import email
+    import re
+
+    logger.info(
+        f"[get_gmail_message_raw] Invoked. Message ID: '{message_id}', "
+        f"Email: '{user_google_email}', extract_headers={extract_headers}, "
+        f"include_html={include_html}"
+    )
+
+    # Fetch the raw RFC 2822 message
+    message_raw = await asyncio.to_thread(
+        service.users()
+        .messages()
+        .get(userId="me", id=message_id, format="raw")
+        .execute
+    )
+
+    raw_data = message_raw.get("raw", "")
+    if not raw_data:
+        return f"Error: No raw data found for message {message_id}"
+
+    # Decode the base64url-encoded raw message
+    raw_bytes = base64.urlsafe_b64decode(raw_data)
+    msg = email.message_from_bytes(raw_bytes)
+
+    # --- Extract headers ---
+    COMMON_HEADERS = {
+        "subject", "from", "to", "cc", "bcc", "date", "message-id",
+        "in-reply-to", "references", "mime-version", "content-type",
+        "content-transfer-encoding", "delivered-to", "received",
+        "return-path", "authentication-results", "dkim-signature",
+        "arc-seal", "arc-message-signature", "arc-authentication-results",
+        "x-received", "x-google-dkim-signature", "x-gm-message-state",
+        "x-google-smtp-source", "x-forwarded-to", "x-forwarded-for",
+    }
+
+    content_lines = [
+        f"Message ID: {message_id}",
+        f"Subject: {msg.get('Subject', '(no subject)')}",
+        f"From: {msg.get('From', '(unknown)')}",
+        f"Date: {msg.get('Date', '(unknown)')}",
+        "",
+    ]
+
+    if extract_headers:
+        # Return only specifically requested headers
+        content_lines.append("--- REQUESTED HEADERS ---")
+        for header_name in extract_headers:
+            value = msg.get(header_name, None)
+            if value:
+                content_lines.append(f"{header_name}: {value}")
+            else:
+                content_lines.append(f"{header_name}: (not found)")
+    else:
+        # Return all non-standard/non-common headers
+        custom_headers = []
+        seen = set()
+        for key, value in msg.items():
+            key_lower = key.lower()
+            if key_lower not in COMMON_HEADERS and key_lower not in seen:
+                custom_headers.append((key, value))
+                seen.add(key_lower)
+
+        if custom_headers:
+            content_lines.append("--- CUSTOM HEADERS ---")
+            for key, value in custom_headers:
+                display_value = value if len(value) <= 5000 else value[:5000] + "..."
+                content_lines.append(f"{key}: {display_value}")
+        else:
+            content_lines.append("--- CUSTOM HEADERS ---")
+            content_lines.append("(no custom headers found)")
+
+    content_lines.append("")
+
+    # --- Extract HTML body ---
+    html_body = None
+    for part in msg.walk():
+        if part.get_content_type() == "text/html":
+            charset = part.get_content_charset() or "utf-8"
+            payload_bytes = part.get_payload(decode=True)
+            if payload_bytes:
+                html_body = payload_bytes.decode(charset, errors="ignore")
+                break
+
+    if html_body:
+        # Always extract HTML comments (e.g., <!-- NEXO_DATA {...} -->)
+        comment_pattern = re.compile(r'<!--\s*(\w+)\s*([\s\S]*?)-->', re.DOTALL)
+        comments = comment_pattern.findall(html_body)
+
+        if comments:
+            content_lines.append("--- HTML COMMENTS ---")
+            for tag, body_text in comments:
+                body_stripped = body_text.strip()
+                if len(body_stripped) > 10000:
+                    body_stripped = body_stripped[:10000] + "\n... (truncated)"
+                content_lines.append(f"[{tag}]")
+                content_lines.append(body_stripped)
+                content_lines.append("")
+
+        if include_html:
+            content_lines.append("--- HTML BODY ---")
+            if len(html_body) > HTML_BODY_TRUNCATE_LIMIT:
+                content_lines.append(
+                    html_body[:HTML_BODY_TRUNCATE_LIMIT] + "\n\n[Content truncated...]"
+                )
+            else:
+                content_lines.append(html_body)
+    else:
+        content_lines.append("(no HTML body found)")
+
+    return "\n".join(content_lines)
