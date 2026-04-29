@@ -2012,15 +2012,36 @@ async def batch_modify_gmail_message_labels(
 
 # Headers excluded from custom-header output because they are either already
 # surfaced by get_gmail_message_content or are infrastructure / transport noise.
-_RAW_COMMON_HEADERS = frozenset({
-    "subject", "from", "to", "cc", "bcc", "date", "message-id",
-    "in-reply-to", "references", "mime-version", "content-type",
-    "content-transfer-encoding", "delivered-to", "received",
-    "return-path", "authentication-results", "dkim-signature",
-    "arc-seal", "arc-message-signature", "arc-authentication-results",
-    "x-received", "x-google-dkim-signature", "x-gm-message-state",
-    "x-google-smtp-source", "x-forwarded-to", "x-forwarded-for",
-})
+_RAW_COMMON_HEADERS = frozenset(
+    {
+        "subject",
+        "from",
+        "to",
+        "cc",
+        "bcc",
+        "date",
+        "message-id",
+        "in-reply-to",
+        "references",
+        "mime-version",
+        "content-type",
+        "content-transfer-encoding",
+        "delivered-to",
+        "received",
+        "return-path",
+        "authentication-results",
+        "dkim-signature",
+        "arc-seal",
+        "arc-message-signature",
+        "arc-authentication-results",
+        "x-received",
+        "x-google-dkim-signature",
+        "x-gm-message-state",
+        "x-google-smtp-source",
+        "x-forwarded-to",
+        "x-forwarded-for",
+    }
+)
 
 # Only match comments that start with an UPPER_SNAKE_CASE tag (e.g. NEXO_DATA).
 # This avoids false positives from regular HTML comments like <!-- page layout -->.
@@ -2069,15 +2090,15 @@ async def get_gmail_message_raw(
     logger.info(
         "[get_gmail_message_raw] Invoked. Message ID: '%s', Email: '%s', "
         "extract_headers=%s, include_html=%s",
-        message_id, user_google_email, extract_headers, include_html,
+        message_id,
+        user_google_email,
+        extract_headers,
+        include_html,
     )
 
     # Fetch the raw RFC 2822 message
     message_raw = await asyncio.to_thread(
-        service.users()
-        .messages()
-        .get(userId="me", id=message_id, format="raw")
-        .execute
+        service.users().messages().get(userId="me", id=message_id, format="raw").execute
     )
 
     raw_data = message_raw.get("raw", "")
@@ -2152,8 +2173,7 @@ async def get_gmail_message_raw(
             content_lines.append("--- HTML BODY ---")
             if len(html_body) > HTML_BODY_TRUNCATE_LIMIT:
                 content_lines.append(
-                    html_body[:HTML_BODY_TRUNCATE_LIMIT]
-                    + "\n\n[Content truncated...]"
+                    html_body[:HTML_BODY_TRUNCATE_LIMIT] + "\n\n[Content truncated...]"
                 )
             else:
                 content_lines.append(html_body)
